@@ -40,6 +40,18 @@
             />
           </div>
 
+          <!-- Toggle Editor Button -->
+          <button
+            @click="$emit('toggle-editor')"
+            class="btn btn-ghost text-sm group"
+            :class="{ 'bg-primary-100 text-primary-600': isEditorVisible }"
+            title="Toggle Code Editor"
+          >
+            <svg class="w-5 h-5 group-hover:text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+            </svg>
+          </button>
+
           <button
             @click="exportChat"
             class="btn btn-ghost text-sm group"
@@ -65,7 +77,21 @@
 
     <!-- Messages Area with Modern Design -->
     <div ref="messagesContainer" class="flex-1 overflow-y-auto px-6 py-6 bg-gradient-to-br from-gray-50/50 via-blue-50/30 to-purple-50/30">
-      <div v-if="messages.length === 0" class="h-full flex items-center justify-center animate-fade-in">
+      <!-- Loading state while fetching messages from server -->
+      <div v-if="chatStore.messagesLoading" class="h-full flex items-center justify-center animate-fade-in">
+        <div class="text-center">
+          <div class="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center shadow-lg animate-pulse">
+            <svg class="w-8 h-8 text-white animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+          </div>
+          <h3 class="text-lg font-semibold text-gray-700 mb-2">Loading messages...</h3>
+          <p class="text-gray-500 text-sm">Fetching chat history from server</p>
+        </div>
+      </div>
+
+      <div v-else-if="messages.length === 0" class="h-full flex items-center justify-center animate-fade-in">
         <div class="text-center">
           <div class="w-24 h-24 mx-auto mb-6 rounded-3xl bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center shadow-2xl shadow-primary-500/30 animate-pulse-slow">
             <svg class="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -133,12 +159,16 @@
 import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { useSessionStore } from '../stores/session'
 import { useChatStore } from '../stores/chat'
+import { useFileStore } from '../stores/file'
 import MessageBubble from './MessageBubble.vue'
 import ChatInput from './ChatInput.vue'
 import ContainerControls from './ContainerControls.vue'
 
+defineEmits(['toggle-editor'])
+
 const sessionStore = useSessionStore()
 const chatStore = useChatStore()
+const fileStore = useFileStore()
 
 const inputMessage = ref('')
 const messagesContainer = ref(null)
@@ -158,6 +188,8 @@ const currentModelDisplay = computed(() => {
   const model = chatStore.selectedModel
   return `${provider}/${model}`
 })
+
+const isEditorVisible = computed(() => fileStore.isEditorVisible)
 
 // Load models on mount
 onMounted(async () => {

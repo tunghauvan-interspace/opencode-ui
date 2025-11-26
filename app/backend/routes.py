@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
+import requests as sync_requests
 
 from core.database import get_db
 from core.models import User
@@ -330,7 +331,7 @@ async def chat_with_session(
         print(f"Requests imported: {requests}")
         
         # Check if we have an existing OpenCode session ID from previous runs
-        existing_opencode_session_id = getattr(session, 'opencode_session_id', None)
+        existing_opencode_session_id = session.opencode_session_id
         print(f"Existing OpenCode session ID from DB: {existing_opencode_session_id}")
         
         # Try to use existing session, or create a new one
@@ -351,15 +352,9 @@ async def chat_with_session(
                     print(f"Created NEW OpenCode session: {opencode_session_id}")
                     
                     # Save the OpenCode session ID to database for future reuse
-                    session_service.update_session_container(
-                        user=current_user,
-                        session_id=session_id,
-                        container_id=session.container_id,
-                        container_status="running"
-                    )
-                    # Update the opencode_session_id field
-                    from core.session_ops import update_session_container as update_session_container_db
-                    update_session_container_db(session_id, session.container_id, "running", opencode_session_id)
+                    session.opencode_session_id = opencode_session_id
+                    db.commit()
+                    print(f"Saved OpenCode session ID to database: {opencode_session_id}")
                 else:
                     print(f"Failed to create OpenCode session: {create_response.status_code} - {create_response.text}")
             except Exception as e:
@@ -433,11 +428,12 @@ async def chat_with_session(
                 elif 'text' in agent_response:
                     content = agent_response['text']
                 
-                if content.strip():  # Only return if we have actual content
+                if content.strip() or (agent_response.get('parts') and len(agent_response['parts']) > 0):  # Return if we have content or parts
                     return {
                         "session_id": session_id,
                         "prompt": prompt,
                         "content": content,
+                        "parts": agent_response.get('parts', []),
                         "status": "success",
                         "container_status": response.status_code
                     }
@@ -483,6 +479,90 @@ async def chat_with_session(
                 "status": "error",
                 "error": f"Agent returned status {response.status_code}",
                 "container_status": response.status_code
+            }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_msg = traceback.format_exc()
+        print(f"ERROR: {error_msg}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@backend_router.get("/sessions/{session_id}/messages")
+async def get_session_messages(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db)
+):
+    """Get all messages for a session from the OpenCode agent"""
+    try:
+        print(f"\n=== GET MESSAGES ENDPOINT CALLED ===")
+        print(f"Session ID: {session_id}")
+        
+        session_service = SessionManagementService(db)
+        session = session_service.get_session(current_user, session_id)
+        
+        print(f"Session found: {session.session_id}")
+        print(f"Container ID: {session.container_id}")
+        print(f"OpenCode Session ID: {session.opencode_session_id}")
+        
+        # If no container or no opencode session, return empty messages
+        if not session.container_id or not session.opencode_session_id:
+            return {
+                "session_id": session_id,
+                "messages": [],
+                "status": "success"
+            }
+        
+        base_url = session.base_url or f"http://agent_{session_id}:4096"
+        opencode_session_id = session.opencode_session_id
+        
+        import requests
+        
+        # Fetch messages from OpenCode agent
+        try:
+            messages_url = f"{base_url}/session/{opencode_session_id}/message"
+            print(f"Fetching messages from: {messages_url}")
+            
+            response = requests.get(messages_url, timeout=30)
+            print(f"Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                messages = response.json()
+                print(f"Fetched {len(messages) if isinstance(messages, list) else 'unknown'} messages")
+                
+                # Normalize messages to expected format
+                normalized_messages = []
+                if isinstance(messages, list):
+                    for msg in messages:
+                        normalized_messages.append(msg)
+                elif isinstance(messages, dict) and 'messages' in messages:
+                    normalized_messages = messages['messages']
+                
+                return {
+                    "session_id": session_id,
+                    "opencode_session_id": opencode_session_id,
+                    "messages": normalized_messages,
+                    "status": "success"
+                }
+            else:
+                print(f"Failed to fetch messages: {response.status_code} - {response.text}")
+                return {
+                    "session_id": session_id,
+                    "messages": [],
+                    "status": "error",
+                    "error": f"Agent returned status {response.status_code}"
+                }
+                
+        except Exception as e:
+            print(f"Error fetching messages: {e}")
+            return {
+                "session_id": session_id,
+                "messages": [],
+                "status": "error",
+                "error": str(e)
             }
     
     except HTTPException:
@@ -540,6 +620,182 @@ async def get_recent_sessions(
         service = SessionAnalyticsService(db)
         sessions = service.get_recent_sessions(current_user, limit)
         return {"sessions": sessions}
+    except Exception as e:
+        error_response = ErrorHandler.handle_error(e)
+        raise HTTPException(status_code=error_response["status_code"], detail=error_response["error"])
+
+
+# Request models for file operations
+class WriteFileRequest(BaseModel):
+    content: str
+    encoding: Optional[str] = 'utf-8'
+
+
+class CreateDirectoryRequest(BaseModel):
+    path: str
+
+
+class DeleteRequest(BaseModel):
+    recursive: Optional[bool] = False
+
+
+# File Access API Routes - Using shared volume
+
+@backend_router.get("/sessions/{session_id}/files/list")
+async def list_files(
+    session_id: str,
+    path: str = Query("/", description="Directory path to list"),
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db)
+):
+    """List files and directories in a session's workspace"""
+    try:
+        session_service = SessionManagementService(db)
+        session = session_service.get_session(current_user, session_id)
+        
+        # Use workspace service for direct file access
+        from core.workspace_service import get_workspace_service
+        workspace = get_workspace_service(session_id)
+        
+        result = workspace.list_directory(path)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        error_response = ErrorHandler.handle_error(e)
+        raise HTTPException(status_code=error_response["status_code"], detail=error_response["error"])
+
+
+@backend_router.get("/sessions/{session_id}/files/read")
+async def read_file(
+    session_id: str,
+    path: str = Query(..., description="File path to read"),
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db)
+):
+    """Read file content from a session's workspace"""
+    try:
+        session_service = SessionManagementService(db)
+        session = session_service.get_session(current_user, session_id)
+        
+        # Use workspace service for direct file access
+        from core.workspace_service import get_workspace_service
+        workspace = get_workspace_service(session_id)
+        
+        result = workspace.read_file(path)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        error_response = ErrorHandler.handle_error(e)
+        raise HTTPException(status_code=error_response["status_code"], detail=error_response["error"])
+
+
+@backend_router.post("/sessions/{session_id}/files/write")
+async def write_file(
+    session_id: str,
+    request: WriteFileRequest,
+    path: str = Query(..., description="File path to write"),
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db)
+):
+    """Write file content to a session's workspace"""
+    try:
+        session_service = SessionManagementService(db)
+        session = session_service.get_session(current_user, session_id)
+        
+        # Use workspace service for direct file access
+        from core.workspace_service import get_workspace_service
+        workspace = get_workspace_service(session_id)
+        
+        result = workspace.write_file(path, request.content, request.encoding or 'utf-8')
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        error_response = ErrorHandler.handle_error(e)
+        raise HTTPException(status_code=error_response["status_code"], detail=error_response["error"])
+
+
+@backend_router.delete("/sessions/{session_id}/files/delete")
+async def delete_file(
+    session_id: str,
+    path: str = Query(..., description="File path to delete"),
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db)
+):
+    """Delete a file from a session's workspace"""
+    try:
+        session_service = SessionManagementService(db)
+        session = session_service.get_session(current_user, session_id)
+        
+        # Use workspace service for direct file access
+        from core.workspace_service import get_workspace_service
+        workspace = get_workspace_service(session_id)
+        
+        result = workspace.delete_file(path)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        error_response = ErrorHandler.handle_error(e)
+        raise HTTPException(status_code=error_response["status_code"], detail=error_response["error"])
+
+
+@backend_router.post("/sessions/{session_id}/files/mkdir")
+async def create_directory(
+    session_id: str,
+    path: str = Query(..., description="Directory path to create"),
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db)
+):
+    """Create a directory in a session's workspace"""
+    try:
+        session_service = SessionManagementService(db)
+        session = session_service.get_session(current_user, session_id)
+        
+        # Use workspace service for direct file access
+        from core.workspace_service import get_workspace_service
+        workspace = get_workspace_service(session_id)
+        
+        result = workspace.create_directory(path)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        error_response = ErrorHandler.handle_error(e)
+        raise HTTPException(status_code=error_response["status_code"], detail=error_response["error"])
+
+
+@backend_router.delete("/sessions/{session_id}/files/rmdir")
+async def delete_directory(
+    session_id: str,
+    path: str = Query(..., description="Directory path to delete"),
+    recursive: bool = Query(False, description="Delete recursively"),
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db)
+):
+    """Delete a directory from a session's workspace"""
+    try:
+        session_service = SessionManagementService(db)
+        session = session_service.get_session(current_user, session_id)
+        
+        # Use workspace service for direct file access
+        from core.workspace_service import get_workspace_service
+        workspace = get_workspace_service(session_id)
+        
+        result = workspace.delete_directory(path, recursive)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         error_response = ErrorHandler.handle_error(e)
         raise HTTPException(status_code=error_response["status_code"], detail=error_response["error"])
